@@ -7,6 +7,7 @@
 - 数据源：纯 mock 数据，无真实数据库
 - 权限模型：`用户 -> 角色 -> 权限`
 - 权限粒度：菜单权限、页面权限、按钮权限、模块可见性
+- 目录实现方式：当前 demo 把“目录/菜单”作为 `menu` 类型权限存放
 
 项目内预置了 `admin`、`manager`、`user` 三种角色，用于演示不同账号登录后系统视图、菜单、路由和操作按钮的差异。
 
@@ -37,7 +38,7 @@
 - 根据用户绑定的角色，动态计算权限集合
 - 对敏感接口做权限校验，不仅前端隐藏按钮，后端也会真正拒绝越权请求
 
-### RBAC 数据关系
+### 角色、权限、目录的数据关系
 
 ```text
 User -> role_ids
@@ -45,11 +46,84 @@ Role -> permission_ids
 Permission -> menu/page/button
 ```
 
+在这个示例里，“目录”不是单独一张表，而是直接放在 `Permission` 里，通过 `type = menu` 区分：
+
+- `menu:*` 控制左侧目录是否展示
+- `page:*` 控制路由页面是否允许进入
+- `button:*` 控制页面内操作按钮是否允许展示和调用
+
+也就是说，当前项目实际采用的是：
+
+```text
+用户(User)
+  -> 角色(Role)
+    -> 权限(Permission)
+       -> 权限类型(type = menu/page/button)
+```
+
 例如：
 
 - `admin`：拥有所有权限
 - `manager`：拥有大部分业务权限，但没有删除和系统配置权限
 - `user`：仅能查看与自己相关的数据和基础页面
+
+如果把这套 mock 数据落到真实数据库，推荐先按下面的关系理解：
+
+```text
+users
+  通过 user_roles 与 roles 多对多关联
+
+roles
+  通过 role_permissions 与 permissions 多对多关联
+
+permissions
+  用 type 区分 menu / page / button
+  当 type = menu 时，这条权限同时携带目录展示信息
+```
+
+可对应成下面这个 ER 关系：
+
+```text
+users --< user_roles >-- roles --< role_permissions >-- permissions
+```
+
+推荐的基础表结构可以是：
+
+```text
+users
+- id
+- username
+- password_hash
+- name
+- status
+
+roles
+- id
+- key
+- name
+- description
+
+permissions
+- id
+- code
+- name
+- type            // menu | page | button
+- module
+- route           // menu/page 常用
+- icon            // menu 常用
+- order_index     // menu 排序
+- description
+
+user_roles
+- user_id
+- role_id
+
+role_permissions
+- role_id
+- permission_id
+```
+
+这套设计和当前 demo 是一一对应的，只是示例里为了便于演示，把 `user_roles` 和 `role_permissions` 两张中间表分别压缩成了 `role_ids`、`permission_ids` 两个数组字段。
 
 ## 项目目录结构
 
@@ -116,7 +190,7 @@ frontend/
 
 ## 核心实现说明
 
-### 1. mock 数据与 RBAC 关系
+### 1. 当前 mock 数据如何映射数据库关系
 
 后端在 [backend/app/mock_store.py](/home/cells/dev/demo/backend/app/mock_store.py) 中维护：
 
@@ -125,26 +199,65 @@ frontend/
 - `PERMISSIONS`
 - `PROJECTS`
 
-其中：
+它们对应数据库中的含义分别是：
 
-- 用户通过 `role_ids` 关联角色
-- 角色通过 `permission_ids` 关联权限
-- 权限包含 `menu` / `page` / `button` 三类
+- `USERS` 对应用户表
+- `ROLES` 对应角色表
+- `PERMISSIONS` 对应权限表
+- `USERS.role_ids` 相当于 `user_roles`
+- `ROLES.permission_ids` 相当于 `role_permissions`
 
-### 2. 权限计算
+其中 `PERMISSIONS` 本身就同时承载了“目录权限、页面权限、按钮权限”三种数据：
 
-[backend/app/services.py](/home/cells/dev/demo/backend/app/services.py) 中的 `build_permission_bundle` 会把角色权限汇总为：
+- 目录权限示例：`menu-dashboard` / `menu:dashboard`
+- 页面权限示例：`page-users` / `page:users`
+- 按钮权限示例：`button-role-delete` / `button:role:delete`
+
+目录相关字段也直接放在权限对象里：
+
+- `route`：目录点击后的跳转地址
+- `icon`：前端菜单图标
+- `order`：目录排序
+- `module`：所属模块
+
+所以这个项目里“目录”和“权限”不是两套数据，而是“目录是一种特殊的权限数据”。
+
+### 2. 后端如何实现权限管理
+
+后端权限链路主要分成四步。
+
+#### 第一步：根据用户角色汇总权限
+
+[backend/app/services.py](/home/cells/dev/demo/backend/app/services.py) 中的 `get_permissions_for_role_ids` 会先根据 `role_ids` 找出角色拥有的全部权限；然后 `build_permission_bundle` 再把权限拆成前端更容易消费的结构：
 
 - `menus`
 - `page_permissions`
 - `button_permissions`
 - `all_permissions`
 
-这样前端和后端都可以复用同一套权限结果。
+其中：
 
-### 3. 后端统一返回结构
+- `menus` 给前端渲染目录
+- `page_permissions` 给前端做路由守卫
+- `button_permissions` 给前端控制按钮显示
+- `all_permissions` 给后端统一做接口鉴权
 
-所有接口返回统一格式：
+这样前后端虽然关注点不同，但都基于同一份权限计算结果。
+
+#### 第二步：登录时下发权限包
+
+[backend/app/api.py](/home/cells/dev/demo/backend/app/api.py) 的 `POST /api/auth/login` 在返回 token 的同时，也会返回：
+
+- `user`
+- `permissions`
+
+这里的 `permissions` 就是后端实时计算出来的权限包，前端登录后无需自己拼装角色权限，只需要直接消费。
+
+#### 第三步：请求时识别当前用户
+
+[backend/app/dependencies.py](/home/cells/dev/demo/backend/app/dependencies.py) 中的 `get_current_user` 会从 `Authorization: Bearer <token>` 中解析出当前用户，再交给后续依赖做权限判断。
+
+补充一下，这个项目的后端接口统一返回：
 
 ```json
 {
@@ -156,7 +269,7 @@ frontend/
 
 异常时也会返回统一结构，便于前端统一处理。
 
-### 4. 后端权限拦截
+#### 第四步：接口级权限拦截
 
 [backend/app/dependencies.py](/home/cells/dev/demo/backend/app/dependencies.py) 中实现了 `require_permission`：
 
@@ -180,19 +293,41 @@ def delete_user(
 ) -> dict:
 ```
 
-这意味着即使前端有人手动构造请求，后端仍会拦截越权操作。
+这意味着：
 
-### 5. 前端登录态与权限上下文
+- 页面按钮即使被前端隐藏了，后端依然会校验
+- 用户即使手动抓包重放请求，后端也会返回 `403`
+- 真正的权限边界是在后端，而不是前端
+
+例如当前项目中的接口权限就是这样分层的：
+
+- `page:*` 权限保护查询页面接口，如 `GET /api/users`
+- `button:*` 权限保护写操作接口，如 `DELETE /api/users/{user_id}`
+- `menu:*` 不直接保护接口，而是主要服务于前端目录渲染
+
+### 3. 前端如何实现权限管理
+
+前端权限链路也分成四层。
+
+#### 第一层：登录态和权限状态统一收口
 
 [frontend/src/contexts/AuthContext.jsx](/home/cells/dev/demo/frontend/src/contexts/AuthContext.jsx) 负责：
 
 - 保存 token
 - 保存用户信息
 - 保存权限包
-- 提供 `hasPagePermission`
-- 提供 `hasButtonPermission`
+- 保存动态菜单 `menus`
+- 暴露 `hasPagePermission`
+- 暴露 `hasButtonPermission`
 
-### 6. 路由守卫
+登录后，前端把后端返回的 `permissions` 缓存在上下文里；刷新页面时如果本地还有 token，则会再调用：
+
+- `GET /api/auth/me`
+- `GET /api/permissions/current`
+
+重新恢复当前用户和权限包。
+
+#### 第二层：路由级权限控制
 
 [frontend/src/router/guards.jsx](/home/cells/dev/demo/frontend/src/router/guards.jsx) 提供三类守卫：
 
@@ -200,7 +335,15 @@ def delete_user(
 - `GuestGuard`：已登录不能再回登录页
 - `PermissionRoute`：无页面权限直接跳转 `403`
 
-### 7. 按钮权限控制
+[frontend/src/router/index.jsx](/home/cells/dev/demo/frontend/src/router/index.jsx) 中每个页面路由都会绑定一个 `page:*` 权限，例如：
+
+- `/users` 对应 `page:users`
+- `/roles` 对应 `page:roles`
+- `/settings` 对应 `page:settings`
+
+这保证了“地址栏直接输入路由”也无法绕过页面权限。
+
+#### 第三层：按钮级权限控制
 
 [frontend/src/components/PermissionGate.jsx](/home/cells/dev/demo/frontend/src/components/PermissionGate.jsx) 用于做按钮级控制，例如：
 
@@ -210,11 +353,42 @@ def delete_user(
 </PermissionGate>
 ```
 
-### 8. 动态菜单
+页面里只要把危险操作或管理操作包在 `PermissionGate` 中，就能根据 `button:*` 权限自动决定是否渲染。
+
+#### 第四层：目录级动态渲染
 
 左侧菜单不写死，而是使用当前权限包中的 `menus` 动态渲染，实现在不同角色登录时自动展示不同导航。
 
 对应实现见 [frontend/src/layouts/AppLayout.jsx](/home/cells/dev/demo/frontend/src/layouts/AppLayout.jsx)。
+
+这部分的关键点是：
+
+- 后端返回当前用户可见的 `menus`
+- 前端只遍历 `menus` 渲染侧边栏
+- 因为目录本质上也是权限数据，所以角色一变，目录就会自动变化
+
+### 4. 角色、权限、目录三者在前后端的协作方式
+
+整个权限流程可以概括成下面这条链路：
+
+```text
+用户登录
+-> 后端根据用户角色聚合权限
+-> 返回 menus / page_permissions / button_permissions
+-> 前端缓存权限包
+-> menus 控制左侧目录
+-> page_permissions 控制路由访问
+-> button_permissions 控制页面按钮
+-> 后端 require_permission 兜底拦截真实请求
+```
+
+如果以后把 mock 数据替换成真实数据库，前后端实现思路其实不用变，只需要把：
+
+- `role_ids` 改成查 `user_roles`
+- `permission_ids` 改成查 `role_permissions`
+- `PERMISSIONS` 改成数据库权限表
+
+而 `build_permission_bundle -> 前端消费权限包 -> 后端依赖鉴权` 这条主链路可以原样保留。
 
 ## 已实现页面
 
